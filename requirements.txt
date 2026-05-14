@@ -3,3 +3,4 @@ Flask
 requests
 mailtd
 firebase-admin
+pyotp

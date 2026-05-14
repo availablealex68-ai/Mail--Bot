@@ -37,7 +37,7 @@ ADMIN_ID = "6670461311"
 user_data = {}
 banned_users = set()
 bot_stats = {'total_mails_generated': 0}
-system_data = {'active_promos': {}, 'bot_active': True, 'force_sub_channels': []} 
+system_data = {'active_promos': {}, 'bot_active': True, 'force_sub_channels': [], 'force_start_version': 0} 
 
 # API Data Structure for MailTD 
 api_data = {
@@ -62,7 +62,8 @@ def save_system_data():
         db.collection('system').document('bot_stats').set(bot_stats)
         db.collection('system').document('settings').set({
             'bot_active': system_data.get('bot_active', True),
-            'force_sub_channels': system_data.get('force_sub_channels', [])
+            'force_sub_channels': system_data.get('force_sub_channels', []),
+            'force_start_version': system_data.get('force_start_version', 0)
         })
     except Exception as e:
         pass
@@ -101,8 +102,10 @@ def load_all_data_from_firebase():
 
         set_doc = db.collection('system').document('settings').get()
         if set_doc.exists: 
-            system_data['bot_active'] = set_doc.to_dict().get('bot_active', True)
-            system_data['force_sub_channels'] = set_doc.to_dict().get('force_sub_channels', [])
+            sd = set_doc.to_dict()
+            system_data['bot_active'] = sd.get('bot_active', True)
+            system_data['force_sub_channels'] = sd.get('force_sub_channels', [])
+            system_data['force_start_version'] = sd.get('force_start_version', 0)
         
         users_ref = db.collection('users').stream()
         for doc in users_ref:
@@ -115,7 +118,7 @@ def load_all_data_from_firebase():
     except Exception as e:
         pass
 
-# --- Force Sub Check ---
+# --- Force Actions ---
 def check_force_sub(chat_id):
     if str(chat_id) == ADMIN_ID: return True
     channels = system_data.get('force_sub_channels', [])
@@ -139,6 +142,12 @@ def check_force_sub(chat_id):
         bot.send_message(chat_id, "⚠️ <b>Bot ব্যবহার করতে হলে আপনাকে আমাদের চ্যানেলগুলোতে যুক্ত হতে হবে!</b>\nনিচের বাটন থেকে জয়েন করে Verify এ ক্লিক করুন:", reply_markup=markup)
         return False
     return True
+
+def check_needs_start(chat_id):
+    if str(chat_id) == ADMIN_ID: return False
+    user_ver = user_data.get(str(chat_id), {}).get('start_version', 0)
+    sys_ver = system_data.get('force_start_version', 0)
+    return user_ver < sys_ver
 
 # --- Load Balancing & Mail Creation ---
 def restore_apis():
@@ -252,7 +261,8 @@ def get_admin_menu():
     markup = InlineKeyboardMarkup(row_width=2)
     bot_state = "🟢 Bot is ON" if system_data.get('bot_active', True) else "🔴 Bot is OFF"
     markup.add(InlineKeyboardButton(bot_state, callback_data="admin_toggle_bot"))
-    markup.add(InlineKeyboardButton("📢 Manage Channels", callback_data="admin_channels"))
+    markup.add(InlineKeyboardButton("📢 Manage Channels", callback_data="admin_channels"),
+               InlineKeyboardButton("🔄 Force /start", callback_data="admin_force_start"))
     markup.add(InlineKeyboardButton("👥 User List", callback_data="admin_users"),
                InlineKeyboardButton("📊 Statistics", callback_data="admin_stats"))
     markup.add(InlineKeyboardButton("🔑 Manage APIs", callback_data="admin_apis_select"),
@@ -490,21 +500,19 @@ def auto_check_mail():
 def init_user(message):
     chat_id = str(message.chat.id)
     if chat_id not in user_data:
-        user_data[chat_id] = {'accounts': [], 'active_index': -1, 'total_generated': 0, 'name': message.from_user.first_name or "Unknown", 'username': f"@{message.from_user.username}" if message.from_user.username else "N/A", 'joined': datetime.now().strftime("%Y-%m-%d"), 'custom_mail_msgs': [], 'server_pref': 'mailtd'}
+        user_data[chat_id] = {'accounts': [], 'active_index': -1, 'total_generated': 0, 'name': message.from_user.first_name or "Unknown", 'username': f"@{message.from_user.username}" if message.from_user.username else "N/A", 'joined': datetime.now().strftime("%Y-%m-%d"), 'custom_mail_msgs': [], 'server_pref': 'mailtd', 'start_version': system_data.get('force_start_version', 0)}
         save_user_data(chat_id)
 
 # --- 2FA Handlers ---
 def show_2fa_otp(chat_id, message_id=None):
     secret = user_data[chat_id].get('2fa_secret', '')
     if not secret: return
-    # Remove spaces and dashes, convert to uppercase to prevent pyotp errors
     secret = secret.upper().replace(" ", "").replace("-", "")
     
     try:
         totp = pyotp.TOTP(secret)
         current_otp = totp.now()
     except Exception:
-        # If pyotp validation completely fails
         msg_text = "❌ <b>Error:</b> ইনভ্যালিড 2FA সিক্রেট কোড। দয়া করে সঠিক কোড দিন।"
         try:
             if message_id: bot.edit_message_text(msg_text, chat_id, message_id)
@@ -530,23 +538,19 @@ def show_2fa_otp(chat_id, message_id=None):
     )
     markup.add(InlineKeyboardButton("🏠 Return to Home", callback_data="2fa_home"))
     
-    # Message update block
     try:
         if message_id: bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
         else: bot.send_message(chat_id, text, reply_markup=markup)
-    except Exception:
-        # Ignore Telegram's "Message is not modified" error when clicking refresh quickly
-        pass
+    except Exception: pass
 
 def process_2fa_secret(message):
     chat_id = str(message.chat.id)
     if message.text and message.text.startswith('/'): return
     
-    # Advanced normalization of secret key
     secret = message.text.strip().upper().replace(" ", "").replace("-", "")
     
     try:
-        pyotp.TOTP(secret).now() # Validate before saving
+        pyotp.TOTP(secret).now() 
         user_data[chat_id]['2fa_secret'] = secret
         save_user_data(chat_id)
         show_2fa_otp(chat_id)
@@ -554,14 +558,60 @@ def process_2fa_secret(message):
         msg = bot.send_message(chat_id, "❌ ইনভ্যালিড 2FA কোড। আবার সঠিকভাবে দিন:", reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Cancel", callback_data="2fa_cancel")))
         bot.register_next_step_handler(msg, process_2fa_secret)
 
+# --- Admin Other Functions ---
+def process_ban(message):
+    if not message.text.isdigit(): return
+    banned_users.add(message.text.strip())
+    save_system_data()
+    bot.send_message(message.chat.id, f"✅ <b>{message.text}</b> কে সাসপেন্ড করা হয়েছে!", reply_markup=get_back_button())
+
+def process_unban(message):
+    if not message.text.isdigit(): return
+    banned_users.discard(message.text.strip())
+    save_system_data()
+    bot.send_message(message.chat.id, f"✅ <b>{message.text}</b> অ্যাকাউন্ট অ্যাক্টিভ করা হয়েছে!", reply_markup=get_back_button())
+
+def process_promo_text(message):
+    bot.clear_step_handler_by_chat_id(message.chat.id)
+    msg = bot.send_message(message.chat.id, "🔗 বাটনের জন্য লিংক দিন (না দিতে চাইলে 'no' লিখুন):")
+    bot.register_next_step_handler(msg, broadcast_promo, promo_message=message)
+
+def broadcast_promo(button_message, promo_message):
+    link = button_message.text.strip()
+    markup = InlineKeyboardMarkup()
+    if link.lower() != 'no' and link.startswith('http'): 
+        markup.add(InlineKeyboardButton("🚀 Visit Link", url=link))
+        
+    bot.send_message(button_message.chat.id, "🚀 <b>Premium Broadcast Started...</b>")
+    
+    def send_to_all():
+        system_data['active_promos'].clear()
+        for uid in list(user_data.keys()):
+            try:
+                header = "🌟 <b>Important Notice from Admin</b> 🌟\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                if promo_message.content_type == 'text':
+                    sent = bot.send_message(uid, f"{header}{promo_message.text}", reply_markup=markup if markup.keyboard else None)
+                else:
+                    sent = bot.copy_message(chat_id=uid, from_chat_id=promo_message.chat.id, message_id=promo_message.message_id, reply_markup=markup if markup.keyboard else None)
+                system_data['active_promos'][uid] = sent.message_id
+            except: pass
+            time.sleep(0.05)
+    threading.Thread(target=send_to_all, daemon=True).start()
+
 # --- Bot Handlers ---
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     init_user(message)
+    chat_id = str(message.chat.id)
+    
+    # Sync Force /start version
+    user_data[chat_id]['start_version'] = system_data.get('force_start_version', 0)
+    save_user_data(chat_id)
+    
     if not check_force_sub(message.chat.id): return
     if is_banned(message.chat.id): return
-    if not system_data.get('bot_active', True) and str(message.chat.id) != ADMIN_ID:
-        bot.send_message(message.chat.id, "🛠 <b>Bot Under Maintenance!</b>\n\nআপডেটের কাজ চলছে। দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন।")
+    if not system_data.get('bot_active', True) and chat_id != ADMIN_ID:
+        bot.send_message(chat_id, "🛠 <b>Bot Under Maintenance!</b>\n\nআপডেটের কাজ চলছে। দয়া করে কিছুক্ষণ পর আবার চেষ্টা করুন।")
         return
         
     welcome_text = (
@@ -574,13 +624,17 @@ def send_welcome(message):
         "• Built-in 2FA Authenticator\n\n"
         "<i>👇 Select an option from the menu below to get started!</i>"
     )
-    bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_menu(str(message.chat.id)))
+    bot.send_message(chat_id, welcome_text, reply_markup=get_main_menu(chat_id))
 
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
     chat_id = str(message.chat.id)
     text = message.text
     init_user(message)
+    
+    if check_needs_start(chat_id):
+        bot.send_message(chat_id, "⚠️ <b>System Update!</b>\nবট ব্যবহার করতে অনুগ্রহ করে /start এ ক্লিক করুন।")
+        return
     
     if not check_force_sub(chat_id): return
     if is_banned(chat_id): return
@@ -736,6 +790,11 @@ def process_add_channel(message):
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback(call):
     chat_id = str(call.message.chat.id)
+    
+    if check_needs_start(chat_id):
+        bot.answer_callback_query(call.id, "⚠️ Please send /start to continue!", show_alert=True)
+        return
+        
     if call.data != "verify_sub" and not check_force_sub(chat_id): return
     if is_banned(chat_id): return
     
@@ -811,8 +870,12 @@ def handle_callback(call):
             save_system_data()
             bot.answer_callback_query(call.id, f"Bot is now {'ON' if system_data['bot_active'] else 'OFF'}")
             bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=get_admin_menu())
+
+        elif call.data == "admin_force_start":
+            system_data['force_start_version'] = system_data.get('force_start_version', 0) + 1
+            save_system_data()
+            bot.answer_callback_query(call.id, "✅ All users are now required to send /start again!", show_alert=True)
             
-        # Admin Channel Management
         elif call.data == "admin_channels":
             ch_list = system_data.get('force_sub_channels', [])
             text = "📢 <b>Force Sub Channels:</b>\n\n"
@@ -847,7 +910,6 @@ def handle_callback(call):
                 removed = ch_list.pop(idx)
                 save_system_data()
                 bot.answer_callback_query(call.id, f"✅ Removed {removed}")
-            # Refresh list
             markup = InlineKeyboardMarkup(row_width=1)
             for i, ch in enumerate(system_data.get('force_sub_channels', [])):
                 markup.add(InlineKeyboardButton(f"❌ Remove: {ch}", callback_data=f"del_ch_{i}"))
@@ -910,6 +972,46 @@ def handle_callback(call):
                     
             stats = f"📊 <b>Bot Live Statistics</b>\n\n👥 Total Users: <b>{total_users}</b>\n🚫 Suspended Users: <b>{len(banned_users)}</b>\n\n📧 Total Mails Gen: <b>{bot_stats['total_mails_generated']}</b>\n🟢 Current Active Mails: <b>{active_accounts}</b>\n\n🌐 Server Usage Distribution:\n- MailTD: <b>{mtd}</b>\n- Mail.gw: <b>{mgw}</b>\n- Mail.tm: <b>{mtm}</b>"
             bot.edit_message_text(stats, chat_id, call.message.message_id, reply_markup=get_back_button())
+            
+        elif call.data == "admin_users":
+            user_list = "👥 <b>Recent Users List:</b>\n\n"
+            for uid, data in list(user_data.items())[-20:]:
+                user_list += f"• {data.get('name', 'Unknown')} (<code>{uid}</code>) - <b>{data.get('total_generated', 0)} Mails</b>\n"
+            bot.edit_message_text(user_list, chat_id, call.message.message_id, reply_markup=get_back_button())
+            
+        elif call.data == "admin_download_txt":
+            bot.answer_callback_query(call.id, "Generating TXT file...")
+            txt_content = "ID | Name | Username | Total Generated\n" + "-"*50 + "\n"
+            for uid, data in user_data.items():
+                txt_content += f"{uid} | {data.get('name', 'Unknown')} | {data.get('username', 'N/A')} | {data.get('total_generated', 0)}\n"
+            
+            with open("user_list.txt", "w", encoding="utf-8") as f:
+                f.write(txt_content)
+                
+            with open("user_list.txt", "rb") as f:
+                bot.send_document(chat_id, f, caption="📄 <b>All Users List</b>", parse_mode='HTML')
+            os.remove("user_list.txt")
+
+        elif call.data == "admin_ban":
+            bot.edit_message_text("✍️ <b>Suspend User:</b>\n\nযাকে সাসপেন্ড করতে চান তার User ID টাইপ করে সেন্ড করুন:", chat_id, call.message.message_id, reply_markup=get_back_button())
+            bot.register_next_step_handler(call.message, process_ban)
+            
+        elif call.data == "admin_unban":
+            bot.edit_message_text("✍️ <b>Activate User:</b>\n\nযাকে অ্যাক্টিভ করতে চান তার User ID সেন্ড করুন:", chat_id, call.message.message_id, reply_markup=get_back_button())
+            bot.register_next_step_handler(call.message, process_unban)
+            
+        elif call.data == "admin_send_promo":
+            bot.clear_step_handler_by_chat_id(chat_id)
+            msg = bot.edit_message_text("📢 <b>Premium Broadcast:</b>\n\nনোটিশ বা প্রোমোশনাল পোস্টের টেক্সট বা ছবি লিখে সেন্ড করুন:", chat_id, call.message.message_id, reply_markup=get_back_button())
+            bot.register_next_step_handler(msg, process_promo_text)
+            
+        elif call.data == "admin_del_promo":
+            deleted = 0
+            for uid, msg_id in system_data['active_promos'].items():
+                try: bot.delete_message(uid, msg_id); deleted += 1
+                except: pass
+            system_data['active_promos'].clear()
+            bot.edit_message_text(f"✅ <b>Promo Deleted!</b>\n\n{deleted} জন ইউজারের ইনবক্স থেকে সর্বশেষ মেসেজ মুছে ফেলা হয়েছে।", chat_id, call.message.message_id, reply_markup=get_back_button())
             
 if __name__ == "__main__":
     load_all_data_from_firebase()

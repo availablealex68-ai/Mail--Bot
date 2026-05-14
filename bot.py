@@ -128,7 +128,7 @@ def check_force_sub(chat_id):
             if status in ['left', 'kicked']:
                 not_joined.append(ch)
         except Exception:
-            pass # Bot not admin or channel invalid, skip for safety
+            pass 
             
     if not_joined:
         markup = InlineKeyboardMarkup(row_width=1)
@@ -495,42 +495,58 @@ def init_user(message):
 
 # --- 2FA Handlers ---
 def show_2fa_otp(chat_id, message_id=None):
-    secret = user_data[chat_id].get('2fa_secret', '').replace(" ", "")
+    secret = user_data[chat_id].get('2fa_secret', '')
+    if not secret: return
+    # Remove spaces and dashes, convert to uppercase to prevent pyotp errors
+    secret = secret.upper().replace(" ", "").replace("-", "")
+    
     try:
         totp = pyotp.TOTP(secret)
         current_otp = totp.now()
-        text = (
-            f"🔐 <b>Your 2FA Authenticator</b>\n\n"
-            f"🔑 <b>Current OTP:</b>\n"
-            f"╔════════════════════════╗\n"
-            f"  <code>{current_otp}</code>\n"
-            f"╚════════════════════════╝\n"
-            f"<i>(Tap the code inside the box to copy)</i>\n\n"
-            f"⏳ <i>Updates every 30 seconds. Click Refresh to get latest OTP.</i>"
-        )
-        markup = InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            InlineKeyboardButton("🔄 Refresh", callback_data="2fa_refresh"),
-            InlineKeyboardButton("➕ New", callback_data="2fa_new")
-        )
-        markup.add(InlineKeyboardButton("🏠 Return to Home", callback_data="2fa_home"))
-        
+    except Exception:
+        # If pyotp validation completely fails
+        msg_text = "❌ <b>Error:</b> ইনভ্যালিড 2FA সিক্রেট কোড। দয়া করে সঠিক কোড দিন।"
+        try:
+            if message_id: bot.edit_message_text(msg_text, chat_id, message_id)
+            else: bot.send_message(chat_id, msg_text)
+        except Exception: pass
+        user_data[chat_id]['2fa_secret'] = None
+        save_user_data(chat_id)
+        return
+
+    text = (
+        f"🔐 <b>Your 2FA Authenticator</b>\n\n"
+        f"🔑 <b>Current OTP:</b>\n"
+        f"╔════════════════════════╗\n"
+        f"  <code>{current_otp}</code>\n"
+        f"╚════════════════════════╝\n"
+        f"<i>(Tap the code inside the box to copy)</i>\n\n"
+        f"⏳ <i>Updates every 30 seconds. Click Refresh to get latest OTP.</i>"
+    )
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🔄 Refresh", callback_data="2fa_refresh"),
+        InlineKeyboardButton("➕ New", callback_data="2fa_new")
+    )
+    markup.add(InlineKeyboardButton("🏠 Return to Home", callback_data="2fa_home"))
+    
+    # Message update block
+    try:
         if message_id: bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
         else: bot.send_message(chat_id, text, reply_markup=markup)
     except Exception:
-        msg_text = "❌ <b>Error:</b> ইনভ্যালিড 2FA সিক্রেট কোড। দয়া করে সঠিক কোড দিন।"
-        if message_id: bot.edit_message_text(msg_text, chat_id, message_id)
-        else: bot.send_message(chat_id, msg_text)
-        user_data[chat_id]['2fa_secret'] = None
-        save_user_data(chat_id)
+        # Ignore Telegram's "Message is not modified" error when clicking refresh quickly
+        pass
 
 def process_2fa_secret(message):
     chat_id = str(message.chat.id)
     if message.text and message.text.startswith('/'): return
     
-    secret = message.text.strip().replace(" ", "")
+    # Advanced normalization of secret key
+    secret = message.text.strip().upper().replace(" ", "").replace("-", "")
+    
     try:
-        pyotp.TOTP(secret).now() # Validate
+        pyotp.TOTP(secret).now() # Validate before saving
         user_data[chat_id]['2fa_secret'] = secret
         save_user_data(chat_id)
         show_2fa_otp(chat_id)
@@ -727,8 +743,9 @@ def handle_callback(call):
 
     # 2FA Callbacks
     elif call.data == "2fa_refresh":
+        try: bot.answer_callback_query(call.id, "✅ Refreshing OTP...")
+        except: pass
         show_2fa_otp(chat_id, call.message.message_id)
-        bot.answer_callback_query(call.id, "✅ Refreshing OTP...")
         
     elif call.data == "2fa_new":
         user_data[chat_id]['2fa_secret'] = None

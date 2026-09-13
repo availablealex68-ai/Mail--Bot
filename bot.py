@@ -29,7 +29,7 @@ except Exception as e:
     db = None
 
 # --- Configuration ---
-TOKEN = '8572418006:AAEQBCXBPxa35yBiSWeaVWVvLP9N326fJos' # আপনার টোকেন
+TOKEN = '8718362961:AAFMBkEMrK4_hvu0ZpeQwZtrsEbUG_V6Yqc' # আপনার টোকেন
 bot = telebot.TeleBot(TOKEN, parse_mode='HTML')
 ADMIN_ID = "6670461311"
 

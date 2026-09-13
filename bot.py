@@ -1,9 +1,10 @@
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, CopyTextButton
 from mailtd import MailTD
 import requests
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import re
 import random
 import string
@@ -338,7 +339,7 @@ def is_banned(chat_id):
 # --- UI Formatter Functions ---
 def get_service_logo_and_name(sender):
     s = str(sender).lower()
-    if 'facebook' in s or 'fb' in s: return '📘', 'Facebook'
+    if 'facebook' in s or 'fb' in s or 'meta' in s: return '📘', 'Facebook/Meta'
     if 'instagram' in s or 'ig' in s: return '📸', 'Instagram'
     if 'google' in s or 'gmail' in s: return '🇬', 'Google'
     if 'tiktok' in s: return '🎵', 'TikTok'
@@ -349,7 +350,7 @@ def get_service_logo_and_name(sender):
     if match: return '🌐', match.group(1).split('.')[0].capitalize()
     return '🌐', 'Web Service'
 
-def extract_and_format(subject, text_body, html_body=""):
+def extract_and_format(subject, text_body, html_body="", sender=""):
     subject_text = subject if subject else "No Subject"
     clean_text = str(text_body) if text_body else ""
     clean_html = ""
@@ -362,13 +363,23 @@ def extract_and_format(subject, text_body, html_body=""):
     
     search_text = f"{subject_text}\n{clean_text}\n{clean_html}".replace('\u200c', '') 
     extracted_otp = ""
-    digit_match = re.search(r'(?<!\d)(\d{6,8})(?!\d)', search_text)
-    spaced_match = re.search(r'([A-Za-z0-9](?:\s+[A-Za-z0-9]){7})', search_text)
-    promo_match = re.search(r'\b([A-Z0-9]{5,8})\b', search_text)
     
-    if digit_match: extracted_otp = digit_match.group(1)
-    elif spaced_match: extracted_otp = spaced_match.group(1).replace(" ", "")
-    elif promo_match and not promo_match.group(1).isdigit(): extracted_otp = promo_match.group(1)
+    # Fast & priority extraction for Meta / Instagram 6 or 8 digit codes
+    is_meta = any(x in sender.lower() for x in ['instagram', 'facebook', 'meta'])
+    if is_meta:
+        meta_match = re.search(r'(?<!\d)(\d{6}|\d{8})(?!\d)', subject_text + " " + search_text)
+        if meta_match:
+            extracted_otp = meta_match.group(1)
+
+    # General Fallbacks
+    if not extracted_otp:
+        digit_match = re.search(r'(?<!\d)(\d{6,8})(?!\d)', search_text)
+        spaced_match = re.search(r'([A-Za-z0-9](?:\s+[A-Za-z0-9]){7})', search_text)
+        promo_match = re.search(r'\b([A-Z0-9]{5,8})\b', search_text)
+        
+        if digit_match: extracted_otp = digit_match.group(1)
+        elif spaced_match: extracted_otp = spaced_match.group(1).replace(" ", "")
+        elif promo_match and not promo_match.group(1).isdigit(): extracted_otp = promo_match.group(1)
 
     link_match = re.search(r'(https?://[^\s\"\'<>]+)', search_text)
     extracted_link = link_match.group(1) if link_match else None
@@ -398,103 +409,118 @@ def generate_mail_layout(email_address, srv_type):
     markup.add(InlineKeyboardButton("🔄 Switch Mail", callback_data="quick_switch"), InlineKeyboardButton("🔄 Force Sync", callback_data="force_fetch"))
     return layout, markup
 
-# --- Auto Checker Engine ---
+# --- Auto Checker Engine (Super Fast Threaded Version) ---
+def process_user_mail(chat_id, data):
+    active_index = data.get('active_index', -1)
+    if active_index < 0 or not data['accounts']: return
+    
+    account = data['accounts'][active_index]
+    acc_token = account.get('api_token', '')
+    email_addr = account['email']
+    srv_type = account.get('server_type', 'mailtd')
+    needs_sync = False
+    
+    try:
+        messages_to_process = []
+        if srv_type in ['mailtm', 'mailgw']:
+            server_domain = "mail.tm" if srv_type == 'mailtm' else "mail.gw"
+            headers = {"Authorization": f"Bearer {acc_token}"}
+            resp = requests.get(f"https://api.{server_domain}/messages", headers=headers, timeout=10)
+            
+            if resp.status_code == 200:
+                resp_json = resp.json()
+                if 'hydra:member' in resp_json:
+                    for msg_preview in resp_json['hydra:member']:
+                        msg_id = msg_preview['id']
+                        if msg_id not in account['seen_msgs']:
+                            account['seen_msgs'].add(msg_id)
+                            needs_sync = True
+                            for m in data.get('recent_mails', []):
+                                if m['email'] == email_addr: m['msg_count'] += 1
+                                
+                            full_msg_resp = requests.get(f"https://api.{server_domain}/messages/{msg_id}", headers=headers, timeout=10)
+                            if full_msg_resp.status_code == 200:
+                                full_msg = full_msg_resp.json()
+                                messages_to_process.append({
+                                    'subject': full_msg.get('subject', 'No Subject'),
+                                    'sender': full_msg.get('from', {}).get('address', 'Unknown'),
+                                    'text': full_msg.get('text', ''),
+                                    'html': full_msg.get('html', '')
+                                })
+        else:
+            # MailTD Logic
+            account_id = account['account_id']
+            if acc_token not in api_clients: api_clients[acc_token] = MailTD(acc_token)
+            temp_client = api_clients[acc_token]
+            
+            messages, _ = temp_client.messages.list(account_id)
+            for msg_preview in messages:
+                msg_id = msg_preview.id
+                if msg_id not in account['seen_msgs']:
+                    account['seen_msgs'].add(msg_id)
+                    needs_sync = True
+                    for m in data.get('recent_mails', []):
+                        if m['email'] == email_addr: m['msg_count'] += 1
+
+                    full_msg = temp_client.messages.get(account_id, msg_id)
+                    messages_to_process.append({
+                        'subject': getattr(full_msg, 'subject', 'No Subject'),
+                        'sender': getattr(full_msg, 'from_address', getattr(full_msg, 'sender', 'Unknown')),
+                        'text': getattr(full_msg, 'text_body', ''),
+                        'html': getattr(full_msg, 'html_body', '')
+                    })
+
+        for msg_data in messages_to_process:
+            extracted_otp, smart_body, verify_link = extract_and_format(msg_data['subject'], msg_data['text'], msg_data['html'], msg_data['sender'])
+            logo, s_name = get_service_logo_and_name(msg_data['sender'])
+            short_email = email_addr.split('@')[0]
+            
+            mail_alert = (
+                f"╭ {logo} {s_name} • {short_email}\n"
+                f"╰ 📌 Sub: {html.escape(msg_data['subject'][:25])}\n\n"
+            )
+            if extracted_otp:
+                mail_alert += (
+                    f"🔑 <b>Verification Code:</b>\n"
+                    f"╔════════════════════════╗\n"
+                    f"  <code>{extracted_otp}</code>\n"
+                    f"╚════════════════════════╝\n"
+                )
+            mail_alert += f"<blockquote>💬 {smart_body[:400]}...</blockquote>"
+            
+            markup = InlineKeyboardMarkup(row_width=2)
+            row = []
+            if extracted_otp:
+                # CopyTextButton is here for 1-click copy feature
+                copy_btn = InlineKeyboardButton(f"📋 {extracted_otp}", copy_text=CopyTextButton(text=extracted_otp))
+                row.append(copy_btn)
+            if verify_link: 
+                row.append(InlineKeyboardButton("🔗 Open Link", url=verify_link))
+            if row: 
+                markup.add(*row)
+            
+            sent_msg = bot.send_message(chat_id, mail_alert, reply_markup=markup, disable_web_page_preview=True)
+            account['msg_ids'].append(sent_msg.message_id)
+
+    except Exception: pass 
+    if needs_sync: save_user_data(chat_id)
+
 def auto_check_mail():
+    # ThreadPoolExecutor added for super fast parallel processing
+    executor = ThreadPoolExecutor(max_workers=20)
     while True:
         try:
+            futures = []
             for chat_id, data in list(user_data.items()):
                 if str(chat_id) in banned_users: continue
-                
-                active_index = data.get('active_index', -1)
-                if active_index >= 0 and data['accounts']:
-                    account = data['accounts'][active_index]
-                    acc_token = account.get('api_token', '')
-                    email_addr = account['email']
-                    srv_type = account.get('server_type', 'mailtd')
-                    needs_sync = False
-                    
-                    try:
-                        messages_to_process = []
-                        if srv_type in ['mailtm', 'mailgw']:
-                            server_domain = "mail.tm" if srv_type == 'mailtm' else "mail.gw"
-                            headers = {"Authorization": f"Bearer {acc_token}"}
-                            resp = requests.get(f"https://api.{server_domain}/messages", headers=headers, timeout=10)
-                            
-                            if resp.status_code == 200:
-                                resp_json = resp.json()
-                                if 'hydra:member' in resp_json:
-                                    for msg_preview in resp_json['hydra:member']:
-                                        msg_id = msg_preview['id']
-                                        if msg_id not in account['seen_msgs']:
-                                            account['seen_msgs'].add(msg_id)
-                                            needs_sync = True
-                                            for m in data.get('recent_mails', []):
-                                                if m['email'] == email_addr: m['msg_count'] += 1
-                                                
-                                            full_msg_resp = requests.get(f"https://api.{server_domain}/messages/{msg_id}", headers=headers, timeout=10)
-                                            if full_msg_resp.status_code == 200:
-                                                full_msg = full_msg_resp.json()
-                                                messages_to_process.append({
-                                                    'subject': full_msg.get('subject', 'No Subject'),
-                                                    'sender': full_msg.get('from', {}).get('address', 'Unknown'),
-                                                    'text': full_msg.get('text', ''),
-                                                    'html': full_msg.get('html', '')
-                                                })
-                        else:
-                            # MailTD Logic
-                            account_id = account['account_id']
-                            if acc_token not in api_clients: api_clients[acc_token] = MailTD(acc_token)
-                            temp_client = api_clients[acc_token]
-                            
-                            messages, _ = temp_client.messages.list(account_id)
-                            for msg_preview in messages:
-                                msg_id = msg_preview.id
-                                if msg_id not in account['seen_msgs']:
-                                    account['seen_msgs'].add(msg_id)
-                                    needs_sync = True
-                                    for m in data.get('recent_mails', []):
-                                        if m['email'] == email_addr: m['msg_count'] += 1
-
-                                    full_msg = temp_client.messages.get(account_id, msg_id)
-                                    messages_to_process.append({
-                                        'subject': getattr(full_msg, 'subject', 'No Subject'),
-                                        'sender': getattr(full_msg, 'from_address', getattr(full_msg, 'sender', 'Unknown')),
-                                        'text': getattr(full_msg, 'text_body', ''),
-                                        'html': getattr(full_msg, 'html_body', '')
-                                    })
-
-                        for msg_data in messages_to_process:
-                            extracted_otp, smart_body, verify_link = extract_and_format(msg_data['subject'], msg_data['text'], msg_data['html'])
-                            logo, s_name = get_service_logo_and_name(msg_data['sender'])
-                            short_email = email_addr.split('@')[0]
-                            
-                            mail_alert = (
-                                f"╭ {logo} {s_name} • {short_email}\n"
-                                f"╰ 📌 Sub: {html.escape(msg_data['subject'][:25])}\n\n"
-                            )
-                            if extracted_otp:
-                                mail_alert += (
-                                    f"🔑 <b>Verification Code:</b>\n"
-                                    f"╔════════════════════════╗\n"
-                                    f"  <code>{extracted_otp}</code>\n"
-                                    f"╚════════════════════════╝\n"
-                                    f"<i>(Tap the code inside the box to copy)</i>\n\n"
-                                )
-                            mail_alert += f"<blockquote>💬 {smart_body[:400]}...</blockquote>"
-                            
-                            markup = InlineKeyboardMarkup(row_width=2)
-                            row = []
-                            if extracted_otp: row.append(InlineKeyboardButton(f"📋 {extracted_otp}", callback_data=f"cp_{extracted_otp}"))
-                            if verify_link: row.append(InlineKeyboardButton("🔗 Open Link", url=verify_link))
-                            if row: markup.add(*row)
-                            
-                            sent_msg = bot.send_message(chat_id, mail_alert, reply_markup=markup, disable_web_page_preview=True)
-                            account['msg_ids'].append(sent_msg.message_id)
-
-                    except Exception: pass 
-                    if needs_sync: save_user_data(chat_id)
+                futures.append(executor.submit(process_user_mail, chat_id, data))
+            
+            # Wait for all checks in this batch to complete
+            for f in futures:
+                try: f.result()
+                except: pass
         except Exception: pass
-        time.sleep(3)
+        time.sleep(1.5) # Reduced delay for faster fetching!
 
 # --- Init User ---
 def init_user(message):
@@ -1014,7 +1040,8 @@ def handle_callback(call):
             bot.edit_message_text(f"✅ <b>Promo Deleted!</b>\n\n{deleted} জন ইউজারের ইনবক্স থেকে সর্বশেষ মেসেজ মুছে ফেলা হয়েছে।", chat_id, call.message.message_id, reply_markup=get_back_button())
             
 if __name__ == "__main__":
-    load_all_data_from_firebase()
+    # Start firebase loading in background to instantly start polling!
+    threading.Thread(target=load_all_data_from_firebase, daemon=True).start()
     threading.Thread(target=run_web_server, daemon=True).start()
     threading.Thread(target=auto_check_mail, daemon=True).start()
     print("🚀 Pro Mail Bot is Live...")
